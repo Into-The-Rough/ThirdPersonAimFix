@@ -1,0 +1,17 @@
+# Build artifacts
+Release/
+Debug/
+*.obj
+*.lib
+*.exp
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.lastbuildstate
+*.recipe
+*.FileListAbsolute.txt
+
+# VS files
+.vs/
+*.user
