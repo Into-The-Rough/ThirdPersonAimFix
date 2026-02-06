@@ -2,25 +2,14 @@
 
 #include <Windows.h>
 #include <stdint.h>
+#include <math.h>
 
 namespace ThirdPersonAimFix {
 
-	float g_blend = 1.0f;
-
-	static void LoadINI() {
-		char iniPath[MAX_PATH];
-		GetModuleFileNameA(NULL, iniPath, MAX_PATH);
-
-		char* lastSlash = strrchr(iniPath, '\\');
-		if (lastSlash) {
-			strcpy(lastSlash + 1, "Data\\config\\ThirdPersonAimFix.ini");
-		}
-
-		g_blend = GetPrivateProfileIntA("Main", "iBlend", 100, iniPath) / 100.0f;
-
-		if (g_blend < 0.0f) g_blend = 0.0f;
-		if (g_blend > 1.0f) g_blend = 1.0f;
-	}
+	static const float CONVERGENCE_DIST = 400.0f; //fallback when raycast misses
+	static const float RAYCAST_START_OFFSET = 20.0f;
+	static const float BLEND_FAR = 250.0f;
+	static const float BLEND_NEAR = 130.0f;
 
 	class MemoryUnlock {
 		SIZE_T addr, size;
@@ -34,26 +23,35 @@ namespace ThirdPersonAimFix {
 		}
 	};
 
-	static void __fastcall SafeWrite8(SIZE_T addr, uint8_t data) {
-		MemoryUnlock unlock(addr, 1);
-		*(uint8_t*)addr = data;
-	}
-
 	static void __fastcall SafeWrite32(SIZE_T addr, SIZE_T data) {
 		MemoryUnlock unlock(addr);
 		*(uint32_t*)addr = data;
 	}
 
-	static void __fastcall WriteRelJump(SIZE_T src, SIZE_T dst) {
-		SafeWrite8(src, 0xE9);
-		SafeWrite32(src + 1, dst - src - 5);
+	static SIZE_T ReplaceCall(SIZE_T addr, SIZE_T newFunc) {
+		SIZE_T originalTarget = *(int32_t*)(addr + 1) + addr + 5;
+		SafeWrite32(addr + 1, newFunc - addr - 5);
+		return originalTarget;
 	}
 
 	struct NiVector3 {
 		float x, y, z;
 	};
 
+	struct NiMatrix3 {
+		float data[9];
+	};
+
+	struct NiTransform {
+		NiMatrix3 rotate;
+		NiVector3 translate;
+		float scale;
+	};
+
 	struct PlayerCharacter {
+		char pad[0x68];
+		void* baseProcess; //0x68
+
 		[[nodiscard]] bool IsThirdPerson() const { return *(uint8_t*)((char*)this + 0x64A) != 0; }
 		[[nodiscard]] static PlayerCharacter* GetSingleton() { return *(PlayerCharacter**)0x11DEA3C; }
 	};
@@ -69,7 +67,8 @@ namespace ThirdPersonAimFix {
 	}
 
 	struct NiCamera {
-		[[nodiscard]] NiVector3& WorldTranslate() const { return *(NiVector3*)((char*)this + 0x8C); }
+		char pad[0x68];
+		NiTransform worldTransform; //0x68
 	};
 
 	[[nodiscard]] static NiCamera* GetMainCamera() {
@@ -84,11 +83,6 @@ namespace ThirdPersonAimFix {
 		uint16_t type;
 	};
 
-	struct tListNode {
-		void* data;
-		tListNode* next;
-	};
-
 	struct TESObjectWEAP {
 		enum WeaponType : uint8_t {
 			kWeapType_OneHandPistol = 3,
@@ -98,162 +92,199 @@ namespace ThirdPersonAimFix {
 		uint8_t eWeaponType;
 	};
 
-	struct Projectile {
-		char pad1[0x20];
-		BGSProjectile* baseForm;
-		float rotX;
-		float rotY;
-		float rotZ;
-		NiVector3 position;
-		char pad2[0x4];
-		void* parentCell;
-		char pad3[0x98];
-		float damage;
-		char pad4[0x18];
-		TESObjectWEAP* sourceWeap;
-		void* sourceRef;
-	};
-
-	static BGSProjectile* g_hitscanForm = nullptr;
-	static bool g_hitscanFormLookedUp = false;
-
-	[[nodiscard]] static uint32_t GetFormRefID(void* form) {
-		return *(uint32_t*)((char*)form + 0x0C);
-	}
-
-	[[nodiscard]] static BGSProjectile* GetHitscanProjectile() {
-		if (!g_hitscanFormLookedUp) {
-			g_hitscanFormLookedUp = true;
-
-			void* dataHandler = *(void**)0x11C3F2C;
-			if (!dataHandler) return nullptr;
-
-			tListNode* node = (tListNode*)((char*)dataHandler + 0x140);
-			BGSProjectile* fallback = nullptr;
-
-			while (node) {
-				BGSProjectile* proj = (BGSProjectile*)node->data;
-				if (proj) {
-					uint32_t refID = GetFormRefID(proj);
-					uint16_t flags = proj->flags;
-					uint16_t type = proj->type;
-					bool isHitscan = (flags & 0x01) != 0;
-					bool hasExplosion = (flags & 0x02) != 0;
-					bool isFlame = (type == 8);
-					bool isBeam = (type == 4);
-
-					if (refID == 0x0007862F) { //9mmBulletProjectile
-						g_hitscanForm = proj;
-						break;
-					}
-
-					if (isHitscan && !hasExplosion && !isFlame && !isBeam && !fallback) {
-						fallback = proj;
-					}
-				}
-				node = node->next;
-			}
-
-			if (!g_hitscanForm && fallback) {
-				g_hitscanForm = fallback;
-			}
-		}
-		return g_hitscanForm;
-	}
-
-	typedef Projectile* (__cdecl* _CreateProjectile)(
+	typedef void* (__cdecl* _CreateProjectile)(
 		BGSProjectile* baseProj, void* sourceActor, void* combatController, void* weapon,
 		NiVector3 pos, float rotZ, float rotX, void* node, void* grenadeTarget,
-		bool alwaysHit, bool ignoreGravity, float angMomentumZ, float angMomentumX, void* parentCell
+		char alwaysHit, char ignoreGravity, float angMomentumZ, float angMomentumX, void* parentCell
 	);
-	static _CreateProjectile CreateProjectile = (_CreateProjectile)0x9BCA60; //BGSProjectile::CreateProjectile
 
-	static void __cdecl AdjustProjectilePosition(Projectile* proj);
+	typedef void* (__thiscall* _bhkPickData_ctor)(void*);
+	typedef void (__thiscall* _bhkPickData_NiSetFrom)(void*, NiVector3*);
+	typedef void (__thiscall* _bhkPickData_NiSetTo)(void*, NiVector3*);
+	typedef void (__thiscall* _bhkPickData_SetFilter)(void*, uint32_t);
+	typedef void* (__thiscall* _TES_Pick)(void*, void*, uint32_t);
 
-	static const SIZE_T kAimProjectile = 0x9BD860; //Projectile::AimProjectile
-	static const SIZE_T kAimProjectileRet = 0x9BD860 + 5;
+	static _bhkPickData_ctor bhkPickData_ctor = (_bhkPickData_ctor)0x4A3C20;
+	static _bhkPickData_NiSetFrom bhkPickData_NiSetFrom = (_bhkPickData_NiSetFrom)0x4A3DA0;
+	static _bhkPickData_NiSetTo bhkPickData_NiSetTo = (_bhkPickData_NiSetTo)0x4A3EB0;
+	static _bhkPickData_SetFilter bhkPickData_SetFilter = (_bhkPickData_SetFilter)0x4A3F70;
+	static _TES_Pick TES_Pick = (_TES_Pick)0x458440;
 
-	static __declspec(naked) void Hook_AimProjectile() {
-		__asm {
-			//save state
-			push ecx
-			pushad
-			pushfd
+	static SIZE_T g_originalCreateProjectile = 0x9BCA60;
 
-			//call adjustment (this ptr at esp+36 after pushes)
-			mov eax, [esp + 36]
-			push eax
-			call AdjustProjectilePosition
-			add esp, 4
+	[[nodiscard]] static uint32_t GetCollisionFilter(int32_t layerType) {
+		PlayerCharacter* pc = PlayerCharacter::GetSingleton();
+		if (!pc || !pc->baseProcess) return 0;
 
-			//restore state
-			popfd
-			popad
-			pop ecx
+		void* ptr1 = *(void**)((uint8_t*)pc->baseProcess + 0x138);
+		if (!ptr1) return 0;
+		void* ptr2 = *(void**)((uint8_t*)ptr1 + 0x594);
+		if (!ptr2) return 0;
+		void* ptr3 = *(void**)((uint8_t*)ptr2 + 0x8);
+		if (!ptr3) return 0;
+		uint32_t baseFilter = *(uint32_t*)((uint8_t*)ptr3 + 0x2C);
 
-			//original prologue
-			push ebp
-			mov ebp, esp
-			push 0xFFFFFFFF
-			jmp kAimProjectileRet
-		}
+		if (layerType < 0) layerType = 6;
+		return (baseFilter & 0xFFFF0000) | (layerType & 0x7F);
 	}
 
-	static void __cdecl AdjustProjectilePosition(Projectile* proj) {
-		if (!proj) [[unlikely]] return;
+	static bool DoRaycast(NiVector3& fromPos, NiVector3& toPos, NiVector3& outHitPoint) {
+		void* g_TES = *(void**)0x11DEA10;
+		if (!g_TES) return false;
 
-		BGSProjectile* baseForm = proj->baseForm;
-		if (!baseForm) [[unlikely]] return;
+		uint32_t filter = GetCollisionFilter(0);
+		if (filter == 0) {
+			outHitPoint = toPos;
+			return false;
+		}
 
-		uint16_t projFlags = baseForm->flags;
-		uint16_t projType = baseForm->type;
-		bool isHitscan = (projFlags & 0x01) != 0;
-		bool isBeam = (projType == 4);
-		bool isFlame = (projType == 8);
-		bool isContinuous = (projType == 16);
+		__declspec(align(16)) char pickDataBuf[0xB0];
+		void* pickData = pickDataBuf;
+		memset(pickData, 0, 0xB0);
+		bhkPickData_ctor(pickData);
 
-		if (isFlame || isContinuous) return;
+		*(float*)((char*)pickData + 0x40) = 1.0f;
+		*(uint32_t*)((char*)pickData + 0x44) = 0xFFFFFFFF;
+		*(uint32_t*)((char*)pickData + 0x50) = 0xFFFFFFFF;
 
-		if (IsInVATS() || IsInTFC()) return;
+		bhkPickData_NiSetFrom(pickData, &fromPos);
+		bhkPickData_NiSetTo(pickData, &toPos);
+		bhkPickData_SetFilter(pickData, filter);
+		TES_Pick(g_TES, pickData, 1);
+
+		float hitFraction = *(float*)((char*)pickData + 0x40);
+		if (hitFraction < 1.0f) {
+			outHitPoint.x = fromPos.x + (toPos.x - fromPos.x) * hitFraction;
+			outHitPoint.y = fromPos.y + (toPos.y - fromPos.y) * hitFraction;
+			outHitPoint.z = fromPos.z + (toPos.z - fromPos.z) * hitFraction;
+			return true;
+		}
+
+		outHitPoint = toPos;
+		return false;
+	}
+
+	[[nodiscard]] static bool ShouldAdjust(void* sourceActor, TESObjectWEAP* weap) {
+		if (IsInVATS() || IsInTFC()) return false;
 
 		PlayerCharacter* pc = PlayerCharacter::GetSingleton();
-		if (!pc || !pc->IsThirdPerson()) return;
-		if (proj->sourceRef != pc) return;
+		if (!pc || !pc->IsThirdPerson()) return false;
+		if (sourceActor != pc) return false;
 
-		TESObjectWEAP* weap = proj->sourceWeap;
 		if (weap) {
 			uint8_t weapType = weap->eWeaponType;
-			if (weapType < TESObjectWEAP::kWeapType_OneHandPistol || weapType > TESObjectWEAP::kWeapType_TwoHandLauncher) return;
+			if (weapType < TESObjectWEAP::kWeapType_OneHandPistol || weapType > TESObjectWEAP::kWeapType_TwoHandLauncher) return false;
 		}
 
-		NiCamera* camera = GetMainCamera();
-		if (!camera) [[unlikely]] return;
+		return true;
+	}
 
-		NiVector3 camPos = camera->WorldTranslate();
-		NiVector3* pos = &proj->position;
+	static void GetCameraForward(NiMatrix3& rot, NiVector3& outFwd) {
+		outFwd.x = rot.data[0];
+		outFwd.y = rot.data[3];
+		outFwd.z = rot.data[6];
+	}
 
-		if (isHitscan) {
-			//lerp from gun barrel toward camera (0=barrel, 1=camera)
-			pos->x += (camPos.x - pos->x) * g_blend;
-			pos->y += (camPos.y - pos->y) * g_blend;
-			pos->z += (camPos.z - pos->z) * g_blend;
+	static void CalcAimAngles(NiVector3& from, NiVector3& to, float& outRotZ, float& outRotX) {
+		float dx = to.x - from.x;
+		float dy = to.y - from.y;
+		float dz = to.z - from.z;
+
+		float horizDist = sqrtf(dx * dx + dy * dy);
+
+		outRotZ = atan2f(dx, dy);
+		outRotX = -atan2f(dz, horizDist);
+	}
+
+	static void* __cdecl Hook_CreateProjectile(
+		BGSProjectile* baseProj, void* sourceActor, void* combatController, void* weapon,
+		NiVector3 pos, float rotZ, float rotX, void* node, void* grenadeTarget,
+		char alwaysHit, char ignoreGravity, float angMomentumZ, float angMomentumX, void* parentCell
+	) {
+		PlayerCharacter* pc = PlayerCharacter::GetSingleton();
+		TESObjectWEAP* weap = (TESObjectWEAP*)weapon;
+		bool shouldAdjust = ShouldAdjust(sourceActor, weap);
+
+		bool isFlame = false;
+		bool isContinuous = false;
+
+		if (baseProj) {
+			uint16_t projType = baseProj->type;
+			isFlame = (projType == 8);
+			isContinuous = (projType == 16);
 		}
-		else {
-			//non-hitscan (plasma bolts etc) - spawn invisible bullet from camera, zero visible projectile
-			BGSProjectile* hitscanForm = GetHitscanProjectile();
-			if (hitscanForm) {
-				CreateProjectile(
-					hitscanForm, proj->sourceRef, nullptr, proj->sourceWeap,
-					camPos, proj->rotZ, proj->rotX, nullptr, nullptr,
-					false, true, 0.0f, 0.0f, proj->parentCell
-				);
-				proj->damage = 0.0f;
+
+		if (isFlame || isContinuous) {
+			shouldAdjust = false;
+		}
+
+		if (shouldAdjust) {
+			NiCamera* camera = GetMainCamera();
+			if (camera && pc) {
+				NiVector3* camPos = (NiVector3*)((uint8_t*)pc + 0xDE0);
+				NiVector3 camFwd;
+				GetCameraForward(camera->worldTransform.rotate, camFwd);
+
+				NiVector3 rayStart;
+				rayStart.x = camPos->x + camFwd.x * RAYCAST_START_OFFSET;
+				rayStart.y = camPos->y + camFwd.y * RAYCAST_START_OFFSET;
+				rayStart.z = camPos->z + camFwd.z * RAYCAST_START_OFFSET;
+
+				NiVector3 rayEnd;
+				rayEnd.x = camPos->x + camFwd.x * 10000.0f;
+				rayEnd.y = camPos->y + camFwd.y * 10000.0f;
+				rayEnd.z = camPos->z + camFwd.z * 10000.0f;
+
+				NiVector3 hitPoint;
+				bool gotHit = DoRaycast(rayStart, rayEnd, hitPoint);
+
+				float targetDist = CONVERGENCE_DIST;
+				if (gotHit) {
+					float dx = hitPoint.x - camPos->x;
+					float dy = hitPoint.y - camPos->y;
+					float dz = hitPoint.z - camPos->z;
+					targetDist = sqrtf(dx*dx + dy*dy + dz*dz);
+				}
+
+				NiVector3 aimPoint;
+				aimPoint.x = camPos->x + camFwd.x * targetDist;
+				aimPoint.y = camPos->y + camFwd.y * targetDist;
+				aimPoint.z = camPos->z + camFwd.z * targetDist;
+
+				//close range: barrel can be past target, blend spawn toward camera
+				float blend = 0.0f;
+				if (targetDist < BLEND_FAR) {
+					blend = (BLEND_FAR - targetDist) / (BLEND_FAR - BLEND_NEAR);
+					if (blend > 1.0f) blend = 1.0f;
+				}
+
+				if (blend > 0.0f) {
+					NiVector3 camSpawn;
+					camSpawn.x = camPos->x + camFwd.x * RAYCAST_START_OFFSET;
+					camSpawn.y = camPos->y + camFwd.y * RAYCAST_START_OFFSET;
+					camSpawn.z = camPos->z + camFwd.z * RAYCAST_START_OFFSET;
+
+					pos.x = pos.x + (camSpawn.x - pos.x) * blend;
+					pos.y = pos.y + (camSpawn.y - pos.y) * blend;
+					pos.z = pos.z + (camSpawn.z - pos.z) * blend;
+				}
+
+				float newRotZ, newRotX;
+				CalcAimAngles(pos, aimPoint, newRotZ, newRotX);
+
+				rotZ = newRotZ;
+				rotX = newRotX;
 			}
 		}
+
+		return ((_CreateProjectile)g_originalCreateProjectile)(
+			baseProj, sourceActor, combatController, weapon,
+			pos, rotZ, rotX, node, grenadeTarget,
+			alwaysHit, ignoreGravity, angMomentumZ, angMomentumX, parentCell
+		);
 	}
 
 	void InitHooks() {
-		LoadINI();
-		WriteRelJump(kAimProjectile, (SIZE_T)&Hook_AimProjectile);
+		g_originalCreateProjectile = ReplaceCall(0x5245BD, (SIZE_T)&Hook_CreateProjectile);
 	}
 }
